@@ -1,0 +1,201 @@
+---
+title: "Part2_data_analysis"
+author: "Qi Li"
+date: "2025-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(car)
+```
+
+## Data loading and set_up
+
+```{r cars}
+# Load your specific cleaned file
+# We use read.csv to ensure it loads as a standard dataframe
+data_raw <- read.csv("hour_cleaned_1.csv")
+
+# CRITICAL STEP: Convert categorical columns to Factors
+# Even though the CSV has "1, 2, 3", R sees these as numbers (1 < 2 < 3).
+# We must tell R they are categories so it treats them as separate groups.
+#data_raw$season     <- as.factor(data_raw$season)
+#data_raw$yr         <- as.factor(data_raw$yr)
+#data_raw$weekday    <- as.factor(data_raw$weekday)
+#data_raw$holiday    <- as.factor(data_raw$holiday)
+#data_raw$weathersit <- as.factor(data_raw$weathersit)
+```
+
+## 2. IMPROVEMENT & TRANSFORMATION
+
+# Improvement 1: Cyclical Transformation for Hour
+To turn the numbers 0–23 into a circle, we use trigonometry. We convert the "Hour" into coordinates $(x, y)$ on a unit circle.Convert to Radians:First, we take the hour $hr$ and divide it by 24 to get the percentage of the day that has passed. We multiply by $2\pi$ (which represents a full circle in geometry).
+```{r pressure, echo=FALSE}
+# Filter strict zeros only where necessary for math (Log of 0 is -Infinity)
+hour_cleaned_p <- data_raw %>%
+  filter(temp > 0, windspeed > 0, hum > 0)
+
+# Improvement 1: Cyclical Transformation for Hour
+# This fixes the "Midnight Problem" by connecting Hour 23 back to Hour 0 using Sine/Cosine
+hour_cleaned_p$hr_sin <- sin(2 * pi * hour_cleaned_p$hr / 24)
+hour_cleaned_p$hr_cos <- cos(2 * pi * hour_cleaned_p$hr / 24)
+
+```
+
+# Improvement 2: Improvement 2: Power Transformations (from your Box-Cox analysis)
+```{r}
+model_p <- lm(cnt ~ season + weekday + holiday + yr +
+                   temp + windspeed + weathersit + hr + hum
+             + season * temp, data = hour_cleaned_p)
+
+powerTransform(model_p)
+p <- powerTransform(cbind(hour_cleaned_p[,c(5,6,9,10)]))
+summary(p)
+```
+
+We apply boxcox information to the filtered dataset
+```{r}
+# cnt: 0.33 -> Cube root
+hour_cleaned_p$bccnt <- (hour_cleaned_p$cnt)^(1/3)
+
+# temp: 0.81 -> 0.8
+hour_cleaned_p$bctemp <- (hour_cleaned_p$temp)^(0.8)
+
+# hum: 0.89 -> 0.9
+hour_cleaned_p$bchum <- (hour_cleaned_p$hum)^(0.9)
+
+# windspeed: -0.02 -> Log
+hour_cleaned_p$bcwindspeed <- log(hour_cleaned_p$windspeed)
+```
+
+## 3. MODEL REFINEMENT (INTERACTIONS & SENSITIVITY)
+
+And we refit the model again to Calculate Cook's Distance.
+
+# Improvement 3: Added 'weekday * hour' interaction to capture different 
+Interaction Terms By adding weekday * (hr_sin + hr_cos), you tell the model: "Do not force the daily curve to look the same. Calculate a separate curve shape for Weekdays and a separate curve shape for Weekends."
+
+```{r}
+# peak times for commuters (Mon-Fri) vs leisure riders (Sat-Sun).
+model_bc <- lm(bccnt ~ yr + season + holiday + weathersit + 
+                    bctemp + bcwindspeed + bchum + 
+                    hr_sin + hr_cos +
+                    season:bctemp + 
+                    weekday * (hr_sin + hr_cos), 
+                  data = hour_cleaned_p)
+```
+
+# Improvement 4: Remove Influential Points (Sensitivity Analysis)
+
+```{r}
+# Calculate Statistics
+n <- nrow(hour_cleaned_p)
+p <- length(coef(model_bc)) - 1
+
+# 1. COOK'S DISTANCE (Global Influence)
+D_i <- cooks.distance(model_bc)
+# CHANGE: Use 4/n instead of qf() to actually find points in this large dataset
+cookcut <- 4 / n 
+
+# 2. LEVERAGE (Extreme Predictor Values)
+h_ii <- hatvalues(model_bc)
+hcut <- 2 * ((p + 1) / n)
+
+# 3. DFFITS (Influence on Prediction)
+dffits_i <- dffits(model_bc)
+fitcut <- 2 * sqrt((p + 1) / n)
+
+plot(model_bc, which = 4, main = "Cook's Distance Plot")
+abline(h = cookcut, col = "red", lty = 2)
+```
+
+```{r}
+# Identify influential points using Cook's Distance (The most robust metric)
+influential_indices <- which(D_i > cookcut)
+
+cat("Original Data Size:", n, "\n")
+cat("Influential Points Identified:", length(influential_indices), "\n")
+
+# Create "Clean" Data
+# We remove the points that fail the Cook's Distance test
+clean_data <- hour_cleaned_p[-influential_indices, ]
+```
+
+```{r}
+model_final <- lm(bccnt ~ yr + season + holiday + weathersit + 
+                    bctemp + bcwindspeed + bchum + 
+                    hr_sin + hr_cos +
+                    season:bctemp + 
+                    weekday * (hr_sin + hr_cos), 
+                  data = clean_data)
+
+summary(model_final)
+
+# Diagnostic Plot: Check if the red line is flatter (better linearity)
+par(mfrow = c(2, 2))
+plot(model_final, id.n = 0)
+
+# Normality Check: The dots should be closer to the line now
+qqnorm(resid(model_final))
+qqline(resid(model_final), col = "red", lwd = 2)
+
+# Print how many influential points were removed
+removed_count <- nrow(hour_cleaned_p) - nrow(model_final)
+cat("Removed", removed_count, "influential points to improve stability.")
+```
+
+```{r}
+vif(model_final)
+```
+
+```{r}
+n <- nrow(clean_data)
+p <- length(coef(model_final)) - 1
+
+# leverage cutoff
+hcut <- 2 * ((p + 1) / n)
+
+# cook's distance cutoff
+cookcut <- qf(0.5, p + 1, n - p - 1)
+
+# dffits cutoff
+fitcut <- 2 * sqrt((p + 1) / n)
+
+# dfbeta cutoff
+betacut <- 2 / sqrt(n)
+
+# leverage statistic
+h_ii <- hatvalues(model_final)
+
+# standardized residuals
+r_i <- rstandard(model_final)
+
+# cook's distance 
+D_i <- cooks.distance(model_final)
+
+# dffits
+dffits_i <- dffits(model_final)
+
+# dfbetas
+dfbetas_i <- dfbetas(model_final)
+
+# which observations are leverage points?
+which(h_ii > hcut)
+
+# which observations are regression outliers?
+which(r_i > 4 | r_i < -4)
+
+# which observations are influential by cook's distance?
+which(D_i > cookcut)
+
+# which observations are influential by dffits?
+which(abs(dffits_i) > fitcut)
+
+# which observations are influential by dfbetas?
+for(i in 1:8){
+  print(paste0("Beta ", i-1))
+  print(which(abs(dfbetas_i[,i]) > betacut))    # this checks all betas in a loop
+}
+```
